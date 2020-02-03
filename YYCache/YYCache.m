@@ -31,7 +31,7 @@
     if (path.length == 0) return nil;
     YYDiskCache *diskCache = [[YYDiskCache alloc] initWithPath:path];
     if (!diskCache) return nil;
-    NSString *name = [path lastPathComponent];
+    NSString *name = [path lastPathComponent]; // 注意缓存名称
     YYMemoryCache *memoryCache = [YYMemoryCache new];
     memoryCache.name = name;
     

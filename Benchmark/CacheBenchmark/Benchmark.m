@@ -21,7 +21,7 @@
     
     // You should benchmark data writing first.
     // Before benchmark data reading, you should kill the app to avoid disk-in-memory cache.
-#define WRITE    false
+#define WRITE    true
 #define READ     true
 #define RANDOMLY true
     

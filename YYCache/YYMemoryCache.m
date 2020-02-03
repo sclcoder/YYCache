@@ -24,7 +24,7 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
  A node in linked map.
  Typically, you should not use this class directly.
  */
-@interface _YYLinkedMapNode : NSObject {
+@interface _YYLinkedMapNode : NSObject { // linkedmap中的节点
     @package
     __unsafe_unretained _YYLinkedMapNode *_prev; // retained by dic
     __unsafe_unretained _YYLinkedMapNode *_next; // retained by dic
@@ -171,7 +171,11 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
 @end
 
 
+/**
+ * OSSpinLock 自旋锁，性能最高的锁。原理很简单，就是一直 do while 忙等。它的缺点是当等待时会消耗大量 CPU 资源，所以它不适用于较长时间的任务。对于内存缓存的存取来说，它非常合适。
+   dispatch_semaphore 是信号量，但当信号总量设为 1 时也可以当作锁来。在没有等待情况出现时，它的性能比 pthread_mutex 还要高，但一旦有等待情况出现时，性能就会下降许多。相对于 OSSpinLock 来说，它的优势在于等待时不会消耗 CPU 资源。对磁盘缓存来说，它比较合适。
 
+ */
 @implementation YYMemoryCache {
     pthread_mutex_t _lock;
     _YYLinkedMap *_lru;
@@ -184,10 +188,14 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
         __strong typeof(_self) self = _self;
         if (!self) return;
         [self _trimInBackground];
-        [self _trimRecursively];
+        [self _trimRecursively]; // 递归实现定时回调
     });
 }
 
+/**
+ _queue是串行队列，那为什么在_trimToCost中还要加上自旋锁?
+ lock 是为了保证内部数据的线程安全，所有访问接口都要经过这个 lock。_queue 只是用来执行后台检查和移除的逻辑，它内部还是要用 lock 来锁住数据的。
+ */
 - (void)_trimInBackground {
     dispatch_async(_queue, ^{
         [self _trimToCost:self->_costLimit];
@@ -210,9 +218,13 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
     
     NSMutableArray *holder = [NSMutableArray new];
     while (!finish) {
+        /**
+         为什么不直接加锁而是尝试加锁:
+         为了尽量保证所有对外的访问方法都不至于阻塞，这个对象移除的方法应当尽量避免与其他访问线程产生冲突。当然这只能在很少一部分使用场景下才可能有些作用吧，而且作用可能也不明显
+         */
         if (pthread_mutex_trylock(&_lock) == 0) {
             if (_lru->_totalCost > costLimit) {
-                _YYLinkedMapNode *node = [_lru removeTailNode];
+                _YYLinkedMapNode *node = [_lru removeTailNode]; // 从尾部开始裁剪
                 if (node) [holder addObject:node];
             } else {
                 finish = YES;
@@ -222,6 +234,12 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
             usleep(10 * 1000); //10 ms
         }
     }
+    /**
+     为什么要这么写:
+     holder 持有了待释放的对象，这些对象应该根据配置在不同线程进行释放(release)。此处 holder 被 block 持有，然后在另外的 queue 中释放。[holder count] 只是为了让 holder 被 block 捕获，保证编译器不会优化掉这个操作，所以随便调用了一个方法。
+     
+     调用 [holder count] 方法只是让主队列或者YYMemoryCacheGetReleaseQueue持有里边对象，并且在指定的队列中进行release
+     */
     if (holder.count) {
         dispatch_queue_t queue = _lru->_releaseOnMainThread ? dispatch_get_main_queue() : YYMemoryCacheGetReleaseQueue();
         dispatch_async(queue, ^{
@@ -335,7 +353,7 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(_appDidReceiveMemoryWarningNotification) name:UIApplicationDidReceiveMemoryWarningNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(_appDidEnterBackgroundNotification) name:UIApplicationDidEnterBackgroundNotification object:nil];
     
-    [self _trimRecursively];
+    [self _trimRecursively]; // 定时裁剪
     return self;
 }
 
@@ -413,20 +431,20 @@ static inline dispatch_queue_t YYMemoryCacheGetReleaseQueue() {
 - (void)setObject:(id)object forKey:(id)key withCost:(NSUInteger)cost {
     if (!key) return;
     if (!object) {
-        [self removeObjectForKey:key];
+        [self removeObjectForKey:key]; // 设置某个key的值为空,则删除已存在的值
         return;
     }
     pthread_mutex_lock(&_lock);
     _YYLinkedMapNode *node = CFDictionaryGetValue(_lru->_dic, (__bridge const void *)(key));
     NSTimeInterval now = CACurrentMediaTime();
-    if (node) {
+    if (node) { // 原来有值
         _lru->_totalCost -= node->_cost;
         _lru->_totalCost += cost;
         node->_cost = cost;
         node->_time = now;
         node->_value = object;
         [_lru bringNodeToHead:node];
-    } else {
+    } else { // 新创建
         node = [_YYLinkedMapNode new];
         node->_cost = cost;
         node->_time = now;

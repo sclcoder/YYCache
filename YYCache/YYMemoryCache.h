@@ -15,14 +15,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 /**
  YYMemoryCache is a fast in-memory cache that stores key-value pairs.
- In contrast to NSDictionary, keys are retained and not copied.
+ In contrast to NSDictionary, keys are retained and not copied. (与NSDictionary相比,keys是不copy的)
  The API and performance is similar to `NSCache`, all methods are thread-safe.
  
  YYMemoryCache objects differ from NSCache in a few ways:
  
  * It uses LRU (least-recently-used) to remove objects; NSCache's eviction method
-   is non-deterministic.
- * It can be controlled by cost, count and age; NSCache's limits are imprecise.
+   is non-deterministic.(使用LRUf算法来删除数据, NSCache的删除方法是不确定的)
+ * It can be controlled by cost, count and age; NSCache's limits are imprecise(不精确).
  * It can be configured to automatically evict objects when receive memory 
    warning or app enter background.
  

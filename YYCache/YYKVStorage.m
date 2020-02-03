@@ -56,6 +56,23 @@ static NSString *const kTrashDirectoryName = @"trash";
  create index if not exists last_access_time_idx on manifest(last_access_time);
  */
 
+
+/**
+ 这个path的父目录即创建diskcache时外部设置的path。
+ 
+ /manifest.sqlite是整个cache的数据库，另外两个文件.sqlite-shm/.sqlite-wal 是数据库产生的临时文件，一个代表共享内存(shared memory)，一个代表日志(write-ahead log)。DB删除的时候，需要把这两个文件一起删除掉。
+ 
+ /data/目录存储了我们缓存的所有文件，和实际文件之间的二进制对应关系可以自定义，默认是archeive方式，文件名也可以自定义，默认是MD5方式
+ 
+ /trash/是data中文件删除前的一道屏障，相当于回收站。不过当前使用的时候，是在reset时机，这时，两个文件夹中的文件会被先后删除。
+
+ SQL 即在manifest.sql库中创建一个manifest表，以记录每一条缓存数据。
+ 包括以文件形式存储的，只是文件的话，inline_data为空。每次对缓存的操作都由last_access_time modification_time进行记录。
+
+ Storage中定义实现了各种增删改查的操作，以及数据库的建立关闭。尤其是数据库的操作，涉及每一个缓存对象，所以在对象dealloc的时候，向系统申请了后台额外时长，以防止后台时进程被系统杀死，导致存储异常。
+ 
+ */
+
 /// Returns nil in App Extension.
 static UIApplication *_YYSharedApplication() {
     static BOOL isAppExtension = NO;
@@ -70,6 +87,7 @@ static UIApplication *_YYSharedApplication() {
     return isAppExtension ? nil : [UIApplication performSelector:@selector(sharedApplication)];
 #pragma clang diagnostic pop
 }
+
 
 
 @implementation YYKVStorageItem
@@ -95,10 +113,11 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)_dbOpen {
     if (_db) return YES;
     
-    int result = sqlite3_open(_dbPath.UTF8String, &_db);
-    if (result == SQLITE_OK) {
+    int result = sqlite3_open(_dbPath.UTF8String, &_db); // 打开数据库,数据库如果不存在会先创建再打开。_db记录数据库
+    if (result == SQLITE_OK) { /// 打开成功
         CFDictionaryKeyCallBacks keyCallbacks = kCFCopyStringDictionaryKeyCallBacks;
         CFDictionaryValueCallBacks valueCallbacks = {0};
+        /// 创建一个缓存，记录stmt
         _dbStmtCache = CFDictionaryCreateMutable(CFAllocatorGetDefault(), 0, &keyCallbacks, &valueCallbacks);
         _dbLastOpenErrorTime = 0;
         _dbOpenErrorCount = 0;
@@ -164,6 +183,35 @@ static UIApplication *_YYSharedApplication() {
 - (BOOL)_dbInitialize {
     NSString *sql = @"pragma journal_mode = wal; pragma synchronous = normal; create table if not exists manifest (key text, filename text, size integer, inline_data blob, modification_time integer, last_access_time integer, extended_data blob, primary key(key)); create index if not exists last_access_time_idx on manifest(last_access_time);";
     return [self _dbExecute:sql];
+    /**
+     "pragma journal_mode = wal"表示使用WAL模式进行数据库操作，如果不指定，默认DELETE模式，是"journal_mode=DELETE"。使用WAL模式时，改写操作数据库的操作会先写入WAL文件，而暂时不改动数据库文件，当执行checkPoint方法时，WAL文件的内容被批量写入数据库。checkPoint操作会自动执行，也可以改为手动。WAL模式的优点是支持读写并发，性能更高，但是当wal文件很大时，需要调用checkPoint方法清空wal文件中的内容。
+     关于WAL模式，可以参考这篇文章。
+     
+     
+     SQLite的WAL机制
+     1.什么是WAL？
+     
+     WAL的全称是Write Ahead Logging，它是很多数据库中用于实现原子事务的一种机制，SQLite在3.7.0版本引入了该特性。
+     
+     2.WAL如何工作？
+     
+     在引入WAL机制之前，SQLite使用rollback journal机制实现原子事务。
+     
+     rollback journal机制的原理是：在修改数据库文件中的数据之前，先将修改所在分页中的数据备份在另外一个地方，然后才将修改写入到数据库文件中；如果事务失败，则将备份数据拷贝回来，撤销修改；如果事务成功，则删除备份数据，提交修改。
+     
+     WAL机制的原理是：修改并不直接写入到数据库文件中，而是写入到另外一个称为WAL的文件中；如果事务失败，WAL中的记录会被忽略，撤销修改；如果事务成功，它将在随后的某个时间被写回到数据库文件中，提交修改。
+     
+     同步WAL文件和数据库文件的行为被称为checkpoint（检查点），它由SQLite自动执行，默认是在WAL文件积累到1000页修改的时候；当然，在适当的时候，也可以手动执行checkpoint，SQLite提供了相关的接口。执行checkpoint之后，WAL文件会被清空。
+     
+     在读的时候，SQLite将在WAL文件中搜索，找到最后一个写入点，记住它，并忽略在此之后的写入点（这保证了读写和读读可以并行执行）；随后，它确定所要读的数据所在页是否在WAL文件中，如果在，则读WAL文件中的数据，如果不在，则直接读数据库文件中的数据。
+     
+     在写的时候，SQLite将之写入到WAL文件中即可，但是必须保证独占写入，因此写写之间不能并行执行。
+     
+     WAL在实现的过程中，使用了共享内存技术，因此，所有的读写进程必须在同一个机器上，否则，无法保证数据一致性。
+     
+     WAL模式下，SQlite中除了db文件，还包含了两个文件，.wal文件和.shm文件，前者是日志文件，后者是日志索引文件。
+     
+     */
 }
 
 - (void)_dbCheckpoint {
@@ -185,11 +233,37 @@ static UIApplication *_YYSharedApplication() {
     
     return result == SQLITE_OK;
 }
+/*  关于sqlite3_stmt对象
+ 
+ ** CAPI3REF: Prepared Statement Object
+ ** KEYWORDS: {prepared statement} {prepared statements}
+ **
+ ** An instance of this object represents a single SQL statement that
+ ** has been compiled into binary form and is ready to be evaluated.
+ **
+ ** Think of each SQL statement as a separate computer program.  The
+ ** original SQL text is source code.  A prepared statement object
+ ** is the compiled object code.  All SQL must be converted into a
+ ** prepared statement before it can be run.
+ **
+ ** The life-cycle of a prepared statement object usually goes like this:
+ **
+ ** <ol>
+ ** <li> Create the prepared statement object using [sqlite3_prepare_v2()].
+ ** <li> Bind values to [parameters] using the sqlite3_bind_*()
+ **      interfaces.
+ ** <li> Run the SQL by calling [sqlite3_step()] one or more times.
+ ** <li> Reset the prepared statement using [sqlite3_reset()] then go back
+ **      to step 2.  Do this zero or more times.
+ ** <li> Destroy the object using [sqlite3_finalize()].
+ ** </ol>
+ */
 
 - (sqlite3_stmt *)_dbPrepareStmt:(NSString *)sql {
     if (![self _dbCheck] || sql.length == 0 || !_dbStmtCache) return NULL;
     sqlite3_stmt *stmt = (sqlite3_stmt *)CFDictionaryGetValue(_dbStmtCache, (__bridge const void *)(sql));
     if (!stmt) {
+        /// 步骤1.创建prepare statement
         int result = sqlite3_prepare_v2(_db, sql.UTF8String, -1, &stmt, NULL);
         if (result != SQLITE_OK) {
             if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite stmt prepare error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
@@ -197,7 +271,7 @@ static UIApplication *_YYSharedApplication() {
         }
         CFDictionarySetValue(_dbStmtCache, (__bridge const void *)(sql), stmt);
     } else {
-        sqlite3_reset(stmt);
+        sqlite3_reset(stmt); /// 步骤4.重置prepare statement
     }
     return stmt;
 }
@@ -219,25 +293,75 @@ static UIApplication *_YYSharedApplication() {
         sqlite3_bind_text(stmt, index + i, key.UTF8String, -1, NULL);
     }
 }
-
+/// 将数据存入数据库: 如果有filename数据库中只存放文件的元数据信息
 - (BOOL)_dbSaveWithKey:(NSString *)key value:(NSData *)value fileName:(NSString *)fileName extendedData:(NSData *)extendedData {
+    
+    /*
+     ** CAPI3REF: Prepared Statement Object
+     ** KEYWORDS: {prepared statement} {prepared statements}
+     **
+     ** An instance of this object represents a single SQL statement that
+     ** has been compiled into binary form and is ready to be evaluated.
+     **
+     ** Think of each SQL statement as a separate computer program.  The
+     ** original SQL text is source code.  A prepared statement object
+     ** is the compiled object code.  All SQL must be converted into a
+     ** prepared statement before it can be run.
+     **
+     ** The life-cycle of a prepared statement object usually goes like this:
+     **
+     ** <ol>
+     ** <li> Create the prepared statement object using [sqlite3_prepare_v2()].
+     ** <li> Bind values to [parameters] using the sqlite3_bind_*()
+     **      interfaces.
+     ** <li> Run the SQL by calling [sqlite3_step()] one or more times.
+     ** <li> Reset the prepared statement using [sqlite3_reset()] then go back
+     **      to step 2.  Do this zero or more times.
+     ** <li> Destroy the object using [sqlite3_finalize()].
+     ** </ol>
+     */
+    
+    /**
+     当要插入大批量数据时,sql语句基本相同,只是字段的值不一样.像这样每次都新生成一条SQL语句让数据库执行
+     let sql = "INSERT INTO T_Person (name, age, height) VALUES ('\(name!)', \(age), \(height));".
+     采用预编译可以将字段值用问号占位,预编译成一条固定的语句,在执行时绑定具体的值到对应的问号位置.
+     提高效率let sql = "INSERT INTO T_Person (name, age, height) VALUES (?, ?, ?);"
+     
+     步骤
+         1.编写带问号的sql:let sql = "INSERT INTO T_Person (name, age, height) VALUES (?, ?, ?);"
+         2.使用sqlite3_prepare_v2预编译这条SQL,获取到 准备语句对象
+         3.单步执行
+         4.重置SQL
+         5.销毁准备语句对象
+     
+     */
+    
+    /**
+     ** Think of each SQL statement as a separate computer program.  The
+     ** original SQL text is source code.  A prepared statement object
+     ** is the compiled object code.  All SQL must be converted into a
+     ** prepared statement before it can be run.
+     */
+    
+    /// source code: 执行预处理对象的操作步骤 1 2 3 4
     NSString *sql = @"insert or replace into manifest (key, filename, size, inline_data, modification_time, last_access_time, extended_data) values (?1, ?2, ?3, ?4, ?5, ?6, ?7);";
+    /// [self _dbPrepareStmt:sql]中包含 步骤1.创建prepare statement 步骤4.重置prepared statement的操作
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return NO;
-    
     int timestamp = (int)time(NULL);
+    /// 2.给参数绑定values
     sqlite3_bind_text(stmt, 1, key.UTF8String, -1, NULL);
     sqlite3_bind_text(stmt, 2, fileName.UTF8String, -1, NULL);
     sqlite3_bind_int(stmt, 3, (int)value.length);
-    if (fileName.length == 0) {
+    if (fileName.length == 0) { /// 如果不是文件将value.bytes存入数据库的inline_data字段
         sqlite3_bind_blob(stmt, 4, value.bytes, (int)value.length, 0);
-    } else {
+    } else { ///如果是文件inline_data字段存放NULL。这样数据库中只存储了文件的元数据,数据存在文件中
         sqlite3_bind_blob(stmt, 4, NULL, 0, 0);
     }
     sqlite3_bind_int(stmt, 5, timestamp);
     sqlite3_bind_int(stmt, 6, timestamp);
     sqlite3_bind_blob(stmt, 7, extendedData.bytes, (int)extendedData.length, 0);
-    
+    /// 3.运行SQL
     int result = sqlite3_step(stmt);
     if (result != SQLITE_DONE) {
         if (_errorLogsEnabled) NSLog(@"%s line:%d sqlite insert error (%d): %s", __FUNCTION__, __LINE__, result, sqlite3_errmsg(_db));
@@ -542,6 +666,7 @@ static UIApplication *_YYSharedApplication() {
 }
 
 - (NSMutableArray *)_dbGetItemSizeInfoOrderByTimeAscWithLimit:(int)count {
+    /// 按照时间升序排列后每次查询count条数据: 即查询最后访问时间最小的count条数据
     NSString *sql = @"select key, filename, size from manifest order by last_access_time asc limit ?1;";
     sqlite3_stmt *stmt = [self _dbPrepareStmt:sql];
     if (!stmt) return nil;
@@ -690,6 +815,10 @@ static UIApplication *_YYSharedApplication() {
     self = [super init];
     _path = path.copy;
     _type = type;
+    /**
+     dataPath和trashPath用于文件的方式读写缓存数据，当dataPath中的部分缓存数据需要被清除时，先将其移至trashPath中，然后统一清空trashPath中的数据，类似回收站的思路。
+     _dbPath是数据库文件，需要创建并初始化
+     */
     _dataPath = [path stringByAppendingPathComponent:kDataDirectoryName];
     _trashPath = [path stringByAppendingPathComponent:kTrashDirectoryName];
     _trashQueue = dispatch_queue_create("com.ibireme.cache.disk.trash", DISPATCH_QUEUE_SERIAL);
@@ -726,6 +855,10 @@ static UIApplication *_YYSharedApplication() {
     return self;
 }
 
+/**
+    beginBackgroundTaskWithExpirationHandler 这个方法会申请3分钟左右的后台存活时间，ios7以前可以存活5-10分钟。
+    这个方法必须与 endBackgroundTask 配对使用。
+*/
 - (void)dealloc {
     UIBackgroundTaskIdentifier taskID = [_YYSharedApplication() beginBackgroundTaskWithExpirationHandler:^{}];
     [self _dbClose];
@@ -747,13 +880,15 @@ static UIApplication *_YYSharedApplication() {
     if (_type == YYKVStorageTypeFile && filename.length == 0) {
         return NO;
     }
-    
+    //如果有文件名，说明需要写入文件中
     if (filename.length) {
+        /// 将数据写入文件
         if (![self _fileWriteWithName:filename data:value]) {
             return NO;
         }
+        /// 将文件的元信息存入数据库
         if (![self _dbSaveWithKey:key value:value fileName:filename extendedData:extendedData]) {
-            [self _fileDeleteWithName:filename];
+            [self _fileDeleteWithName:filename]; /// 如果失败就删除该文件
             return NO;
         }
         return YES;
@@ -764,6 +899,7 @@ static UIApplication *_YYSharedApplication() {
                 [self _fileDeleteWithName:filename];
             }
         }
+        /// 存入数据库
         return [self _dbSaveWithKey:key value:value fileName:nil extendedData:extendedData];
     }
 }
@@ -868,7 +1004,7 @@ static UIApplication *_YYSharedApplication() {
     BOOL suc = NO;
     do {
         int perCount = 16;
-        items = [self _dbGetItemSizeInfoOrderByTimeAscWithLimit:perCount];
+        items = [self _dbGetItemSizeInfoOrderByTimeAscWithLimit:perCount];/// 根据最后访问时间
         for (YYKVStorageItem *item in items) {
             if (total > maxSize) {
                 if (item.filename) {
